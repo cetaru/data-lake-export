@@ -10,7 +10,8 @@
   "scripts": {
     "export": "node bin/export.mjs",
     "validate": "node bin/validate.mjs",
-    "build-catalog": "node bin/build-catalog.mjs"
+    "build-catalog": "node bin/build-catalog.mjs",
+    "sync-postgres": "node bin/sync-postgres.mjs"
   },
   "dependencies": {
     "@duckdb/node-api": "^1.5.4-r.1",

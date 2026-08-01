@@ -88,11 +88,50 @@ PB_DATA=../pb/pb_tsp/pb_data/data.db TENANT_ID=tsp PB_URL=http://localhost:8092 
 | `PB_URL` (validate) | `http://localhost:8090` | hook /pm2pro del tenant a comparar |
 | `VALIDATE_PROJECT_CODE` (validate) | proyecto con más reviews | proyecto piloto a inspeccionar |
 
-## Catálogo DuckDB para Metabase
+## Metabase: materializado en Postgres (recomendado)
 
-Metabase (u otra BI) no debería tener que conocer la estructura de
-particiones Hive del lake. `bin/build-catalog.mjs` genera un archivo
-`.duckdb` persistido con vistas ya armadas:
+**El catálogo `.duckdb` (sección siguiente) NO es viable como conexión de
+Metabase en esta VPS**: el driver comunitario de DuckDB para Metabase
+requiere su librería nativa (compilada contra glibc); la imagen oficial de
+Metabase es Alpine (musl) y el binario nativo crashea con `SIGSEGV` al
+inicializar — probado, incluso instalando `gcompat` + `libstdc++` en el
+container. No se puede resolver sin reconstruir la imagen Docker de Metabase
+sobre una base glibc (Debian/Ubuntu), que es demasiado para este alcance.
+
+**Solución que sí funciona**: `bin/sync-postgres.mjs` usa la extensión
+`postgres` de DuckDB (`ATTACH ... TYPE postgres`) para escribir el lake
+directo a una base Postgres — el mismo Postgres que ya corre en
+`metabase/docker-compose.yml` (container `metabase-postgres`, ahí también
+vive la app-db de Metabase). Se creó una base separada `lake` (no reusar la
+base `metabase`, es la app-db interna). Metabase se conecta con su driver
+Postgres nativo — JDBC puro, sin librería nativa, cero riesgo del problema
+de arriba.
+
+```bash
+# requiere el puerto 5432 expuesto en docker-compose (127.0.0.1:5432:5432)
+PG_HOST=127.0.0.1 PG_PORT=5432 PG_DATABASE=lake PG_USER=metabase PG_PASSWORD=metabase \
+  LAKE_DIR=/data/lake npm run sync-postgres
+```
+
+Escribe una tabla por dataset (`CREATE OR REPLACE TABLE`, reescribe entera
+cada corrida — los datos son chicos):
+
+| Tablas | Contenido |
+|---|---|
+| `{collection}` (una por colección raw) | solo el `snapshot_date` más reciente **de cada tenant** (estado actual — no arrastra el historial completo a Postgres, eso vive en el lake Parquet) |
+| `evm_daily`, `evm_series` | histórico completo (chicas, para curvas de tendencia) |
+
+Correr después de cada `export` (o en el mismo cron, encadenado). Conectar
+Metabase: Admin → Databases → Add → Postgres, host `postgres` (nombre del
+service en la red de Docker, **no** `127.0.0.1` — eso es solo para conectar
+desde el host), puerto `5432`, database `lake`.
+
+## Catálogo DuckDB (análisis ad-hoc, CLI — no Metabase)
+
+No usar esta vía para conectar Metabase (ver bloqueo arriba). Sirve para
+análisis ad-hoc con el `duckdb` CLI o scripts Node, sin conocer la
+estructura de particiones Hive del lake. `bin/build-catalog.mjs` genera un
+archivo `.duckdb` persistido con vistas ya armadas:
 
 ```bash
 LAKE_DIR=/data/lake CATALOG_PATH=/data/lake/lake.duckdb npm run build-catalog
