@@ -121,10 +121,11 @@ cada corrida — los datos son chicos):
 | `{collection}` (una por colección raw) | solo el `snapshot_date` más reciente **de cada tenant** (estado actual — no arrastra el historial completo a Postgres, eso vive en el lake Parquet) |
 | `evm_daily`, `evm_series` | histórico completo (chicas, para curvas de tendencia) |
 
-Correr después de cada `export` (o en el mismo cron, encadenado). Conectar
-Metabase: Admin → Databases → Add → Postgres, host `postgres` (nombre del
-service en la red de Docker, **no** `127.0.0.1` — eso es solo para conectar
-desde el host), puerto `5432`, database `lake`.
+Correr después de cada `export` — encadenado vía `npm run daily`
+(`bin/daily.mjs`, ver Scheduling). Conectar Metabase: Admin → Databases →
+Add → Postgres, host `postgres` (nombre del service en la red de Docker,
+**no** `127.0.0.1` — eso es solo para conectar desde el host), puerto
+`5432`, database `lake`.
 
 ## Catálogo DuckDB (análisis ad-hoc, CLI — no Metabase)
 
@@ -165,12 +166,21 @@ donde vive `lake.duckdb`, con el driver DuckDB de Metabase ya instalado en
 ## Scheduling (producción)
 
 Diario 03:30 (después de que cada instancia PocketBase corra su cron
-`sync_holidays` de las 03:00):
+`sync_holidays` de las 03:00). `bin/daily.mjs` encadena `export.mjs` →
+`sync-postgres.mjs` — si `export` falla parcialmente (algún tenant), igual
+sigue con `sync-postgres` para reflejar los datos parciales; el exit code
+final es no-cero si cualquiera de los dos falló:
 
 ```bash
-pm2 start bin/export.mjs --name lake-export --cron "30 3 * * *" --no-autorestart
+pm2 start bin/daily.mjs --name lake-daily --cron "30 3 * * *" --no-autorestart
 pm2 save
 ```
+
+Requiere las mismas env vars de `export.mjs` (`LAKE_DIR`, `PB_WS_URL`,
+`PB_WS_ADMIN_EMAIL`/`PASSWORD` o `PB_DATA`+`TENANT_ID`) más las de
+`sync-postgres.mjs` (`PG_HOST`/`PORT`/`DATABASE`/`USER`/`PASSWORD`) en el
+entorno del proceso pm2 (`pm2 start` hereda el shell actual, o usar un
+ecosystem file con `env:`).
 
 ## Colecciones exportadas (raw)
 
