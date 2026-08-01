@@ -88,6 +88,41 @@ PB_DATA=../pb/pb_tsp/pb_data/data.db TENANT_ID=tsp PB_URL=http://localhost:8092 
 | `PB_URL` (validate) | `http://localhost:8090` | hook /pm2pro del tenant a comparar |
 | `VALIDATE_PROJECT_CODE` (validate) | proyecto con más reviews | proyecto piloto a inspeccionar |
 
+## Catálogo DuckDB para Metabase
+
+Metabase (u otra BI) no debería tener que conocer la estructura de
+particiones Hive del lake. `bin/build-catalog.mjs` genera un archivo
+`.duckdb` persistido con vistas ya armadas:
+
+```bash
+LAKE_DIR=/data/lake CATALOG_PATH=/data/lake/lake.duckdb npm run build-catalog
+```
+
+Por cada dataset (colecciones raw, vistas raw, curated) crea dos vistas:
+
+| Vista | Contenido |
+|---|---|
+| `raw_{collection}` / `curated_{name}` | histórico completo, todos los snapshots y tenants |
+| `raw_{collection}_latest` / `curated_{name}_latest` | solo el `snapshot_date` más reciente **de cada tenant** (no un max global — un tenant atrasado no debe opacar a los demás) |
+
+Para indicadores de estado actual (portfolio, KPIs) usar las `_latest`; para
+curvas históricas (EVM, tendencias), las históricas.
+
+**No hace falta reconstruir el catálogo en cada export diario** — las vistas
+usan `read_parquet(glob, hive_partitioning=true)`, que resuelve el glob en
+cada query. Solo hay que re-correr `build-catalog` cuando se agrega o saca un
+dataset (nueva colección raw, nueva vista curada).
+
+**Paths**: cada vista tiene embebido el `LAKE_DIR` usado al construir el
+catálogo. Quien abra el `.duckdb` después (Metabase corriendo en Docker, el
+`duckdb` CLI en el host) tiene que ver el lake en ese **mismo path
+absoluto** — la convención acá es montar el lake en el container Docker de
+Metabase en el mismo path que tiene en el host, para no traducir nada
+(ver `metabase/docker-compose.yml`: monta `LAKE_DIR` 1:1 y `data/duckdb/`
+donde vive `lake.duckdb`, con el driver DuckDB de Metabase ya instalado en
+`plugins/`). Conectar Metabase apuntando el driver DuckDB al archivo
+`.duckdb` dentro del container.
+
 ## Scheduling (producción)
 
 Diario 03:30 (después de que cada instancia PocketBase corra su cron
