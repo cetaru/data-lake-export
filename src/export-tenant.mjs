@@ -16,11 +16,10 @@
  *   el snapshot del día (escribe a directorio temporal y renombra al final).
  * - Lectura SQLite en READ_ONLY: con WAL habilitado (default de PocketBase)
  *   los lectores no bloquean al writer, y read-only no puede corromper la DB.
- * - La lógica EVM se porta 1:1 de pb_hooks/get.pm2pro.pb.js de cada instancia
- *   (mismo hook en todos los tenants — misma versión de approcket). El SQL
- *   corre sobre SQLite vía node:sqlite (mismo motor/dialecto que el hook,
- *   incluida strftime(...,'weekday 0')) para que la validación contra
- *   /pm2pro/{project} cierre exacto; DuckDB se usa para leer tablas y
+ * - La lógica EVM NO se reimplementa acá: se carga el mismo módulo que usa
+ *   el hook /pm2pro (approcket pb_hooks/lib/evm.js, ver src/evm-lib.mjs). El
+ *   SQL corre sobre SQLite vía node:sqlite (mismo motor/dialecto que el hook,
+ *   incluida strftime(...,'weekday 0')); DuckDB se usa para leer tablas y
  *   escribir Parquet.
  */
 import { DuckDBInstance } from '@duckdb/node-api';
@@ -28,6 +27,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { mkdir, rm, rename, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
+import { loadEvmLib, toSqlite } from './evm-lib.mjs';
 
 // Colecciones raw (ver README). users, config, pdf_templates, etc. quedan
 // excluidas (PII / operativas / legacy).
@@ -43,78 +43,29 @@ export const RAW_COLLECTIONS = [
   // financiero
   'budgets', 'budget_items', 'costs', 'costs_items', 'tariff', 'tariff_items',
   'credit_rules', 'credit_rules_items', 'transactions', 'type_transaction',
+  // catálogos
+  'origen_type', // ignored_count=1 marca documentos cancelados (fuera de los informes)
   // dispatch
   'dispatchs', 'dispatch_items',
 ];
 
-// Vistas SQL con lógica de agregación valiosa — se exportan si la extensión
-// sqlite de DuckDB puede leerlas.
+// Vistas SQL con lógica de agregación valiosa. Se leen con node:sqlite (la
+// extensión sqlite de DuckDB no parsea los backticks de estas vistas).
+// list_document_forecast trae erev_a/b/0: fecha de emisión por umbral de
+// crédito acumulado, el criterio de "revisión emitida" de la app.
 export const RAW_VIEWS = ['list_hours', 'list_document_forecast', 'list_resume_hours'];
 
-// ─── EVM (portado 1:1 de pb_hooks/get.pm2pro.pb.js) ──────────────────────────
-
-function interpolateY(data, x2) {
-  const x2Time = new Date(x2).getTime();
-  const times = data.map((p) => new Date(p.week).getTime());
-  for (let i = 0; i < data.length - 1; i++) {
-    if (x2Time >= times[i] && x2Time <= times[i + 1]) {
-      const p1 = data[i], p2 = data[i + 1];
-      return parseFloat(p1.value) +
-        (parseFloat(p2.value) - parseFloat(p1.value)) *
-        ((x2Time - times[i]) / (times[i + 1] - times[i]));
-    }
-  }
-  return data.length > 0 ? parseFloat(data[data.length - 1].value) : null;
-}
-
-function accumulateByWeek(rows) {
-  const grouped = {};
-  for (const r of rows) grouped[r.week] = (grouped[r.week] || 0) + r.value;
-  const weeks = Object.keys(grouped).sort();
-  let acc = 0;
-  return weeks.map((week) => {
-    acc += grouped[week];
-    return { week, value: parseFloat(acc.toFixed(2)) };
-  });
-}
-
-const startRow = `SELECT 0 as value, strftime('%Y-%m-%d', :start_date) as week`;
-
-function plannedSql(isAB0) {
-  return isAB0
-    ? `${startRow}
-       UNION ALL SELECT sum(weight*.7*100),  strftime('%Y-%m-%d',rev_a,'weekday 0') FROM documents WHERE project=:project AND rev_a<>'' GROUP BY 2
-       UNION ALL SELECT sum(weight*.15*100), strftime('%Y-%m-%d',rev_b,'weekday 0') FROM documents WHERE project=:project AND rev_b<>'' GROUP BY 2
-       UNION ALL SELECT sum(weight*.15*100), strftime('%Y-%m-%d',rev_0,'weekday 0') FROM documents WHERE project=:project AND rev_0<>'' GROUP BY 2
-       ORDER BY 2`
-    : `${startRow}
-       UNION ALL SELECT sum(weight*.7*100), strftime('%Y-%m-%d',rev_a,'weekday 0') FROM documents WHERE project=:project AND rev_a<>'' GROUP BY 2
-       UNION ALL SELECT sum(weight*.3*100), strftime('%Y-%m-%d',rev_0,'weekday 0') FROM documents WHERE project=:project AND rev_0<>'' GROUP BY 2
-       ORDER BY 2`;
-}
-
-function realSql(isAB0) {
-  const rev = (r) =>
-    `UNION ALL SELECT sum(weight * real_credit), strftime('%Y-%m-%d', date, 'weekday 0') FROM document_review WHERE project=:project AND review='${r}' AND date<>'' GROUP BY 2`;
-  return isAB0
-    ? `${startRow}\n${rev('A')}\n${rev('B')}\n${rev('0')}\nORDER BY 2`
-    : `${startRow}\n${rev('A')}\n${rev('0')}\nORDER BY 2`;
-}
-
-function activitySql(isAB0) {
-  // El hook usa la vista list_documents para hs_total; node:sqlite la lee igual.
-  const rev = (r) =>
-    `UNION ALL SELECT sum((cast(hs_total as real) / :hours_oc) * real_credit), strftime('%Y-%m-%d', date, 'weekday 0') FROM document_review INNER JOIN list_documents ON document_review.document = list_documents.id WHERE document_review.project=:project AND review='${r}' AND date<>'' GROUP BY 2`;
-  return isAB0
-    ? `${startRow}\n${rev('A')}\n${rev('B')}\n${rev('0')}\nORDER BY 2`
-    : `${startRow}\n${rev('A')}\n${rev('0')}\nORDER BY 2`;
-}
-
 /**
- * Calcula evm_daily + evm_series para todos los proyectos de un tenant.
+ * Calcula evm_daily + evm_series para todos los proyectos de un tenant, con
+ * las queries y la matemática de KPIs del módulo compartido con el hook
+ * /pm2pro.
  * `sq` es una DatabaseSync read-only sobre el data.db del tenant.
  */
 export function computeEvm(sq, snapshotDate) {
+  const evm = loadEvmLib();
+  const all = (sql, bind) => { const q = toSqlite(sql, bind); return sq.prepare(q.text).all(q.bind); };
+  const get = (sql, bind) => { const q = toSqlite(sql, bind); return sq.prepare(q.text).get(q.bind); };
+
   const today = new Date().toISOString().slice(0, 10);
   const hoursCutoff = snapshotDate === today
     ? new Date().toISOString().slice(0, 19).replace('T', ' ')
@@ -125,64 +76,35 @@ export function computeEvm(sq, snapshotDate) {
   const series = [];
 
   for (const project of projects) {
-    const cfg = sq.prepare(`
-      SELECT ifnull(cr.code, '') as code,
-             ifnull(p.start_date, '') as start_date,
-             (SELECT sum(hs_pas+hs_cad+hs_jr+hs_ssr+hs_sr)
-              FROM documents WHERE project = p.id) as hours_oc
-      FROM projects p
-      LEFT JOIN credit_rules cr ON p.credit_rule = cr.id
-      WHERE p.id = :project
-    `).get({ project: project.id });
-
-    const hoursActual = sq.prepare(`
-      SELECT ifnull(sum(h.hours), 0) as value
-      FROM hours h
-      INNER JOIN documents d ON h.document = d.id
-      INNER JOIN specialties s ON h.specialty = s.id
-      WHERE d.project = :project
-        AND h.date <= :cutoff
-        AND s.ignored_count = 0
-    `).get({ project: project.id, cutoff: hoursCutoff }).value;
+    const cfg = get(evm.configSql, { project: project.id });
+    const hoursActual = get(evm.hoursActualSql, { project: project.id, cutoff: hoursCutoff }).value;
 
     const isAB0 = cfg.code === 'AB0';
-    const bindBase = { project: project.id, start_date: cfg.start_date };
+    const bind = evm.seriesBind(project.id, cfg);
 
-    const rowsBase = sq.prepare(plannedSql(isAB0)).all(bindBase);
-    const rowsReal = sq.prepare(realSql(isAB0)).all(bindBase);
-    const rowsActivity = sq.prepare(activitySql(isAB0))
-      .all({ ...bindBase, hours_oc: cfg.hours_oc || 1 });
+    const cumBase = evm.accumulateByWeek(all(evm.plannedSql(isAB0), bind));
+    const cumReal = evm.accumulateByWeek(all(evm.realSql(), bind));
+    const cumActivity = evm.accumulateByWeek(all(evm.activitySql(), bind));
 
-    const clean = (rows) => rows.filter((r) => r.value !== null).map((r) => ({ week: r.week, value: Number(r.value) }));
-    const cumBase = accumulateByWeek(clean(rowsBase));
-    const cumReal = accumulateByWeek(clean(rowsReal));
-    const cumActivity = accumulateByWeek(clean(rowsActivity));
-
-    const plannedPct = interpolateY(cumBase, snapshotDate);
-    const plannedValid = plannedPct && isFinite(plannedPct) && plannedPct > 0 ? plannedPct : 0;
-    const realLast = cumReal.length > 0 ? parseFloat(cumReal[cumReal.length - 1].value) : 0;
-    const activityLast = cumActivity.length > 0 ? parseFloat(cumActivity[cumActivity.length - 1].value) : 0;
-
-    // HPI = PV/AC en horas (así lo calcula el hook; no es EV/AC — se porta
-    // tal cual para que la validación contra /pm2pro cierre)
-    let hpi = hoursActual > 0 && plannedValid > 0 && cfg.hours_oc > 0
-      ? ((plannedValid / 100) * cfg.hours_oc) / hoursActual : 0;
-    if (!isFinite(hpi)) hpi = 0;
-    let spi = realLast > 0 && plannedValid > 0 ? realLast / plannedValid : 0;
-    if (!isFinite(spi)) spi = 0;
+    const hoursOc = cfg.hours_oc ?? 0;
+    const kpis = evm.computeKpis(cumBase, cumReal, hoursOc, hoursActual, snapshotDate);
+    const activityLast = cumActivity.length > 0 ? cumActivity[cumActivity.length - 1].value : 0;
 
     daily.push({
       project_id: project.id,
       project_code: project.code,
       credit_rule_code: cfg.code,
-      hours_oc: cfg.hours_oc ?? 0,
-      pv_pct: plannedValid,
-      ev_pct: realLast,
+      pct_a: bind.pct_a,
+      pct_b: bind.pct_b,
+      pct_0: bind.pct_0,
+      hours_oc: hoursOc,
+      pv_pct: kpis.planned_pct,
+      ev_pct: kpis.real_pct,
       ev_activity_pct: activityLast,
       hours_actual: hoursActual,
-      hours_planned: (plannedValid / 100) * (cfg.hours_oc ?? 0),
-      hpi,
-      spi,
+      hours_planned: (kpis.planned_pct / 100) * hoursOc,
+      hpi: kpis.hpi,
+      spi: kpis.spi,
     });
 
     for (const [serie, cum] of [['planned', cumBase], ['real', cumReal], ['activity', cumActivity]]) {
@@ -250,16 +172,22 @@ export async function exportTenant({ lakeDir, pbData, tenantId, snapshotDate }) 
       await copyToParquet('raw', coll, `SELECT * FROM pb."${coll}"`);
     }
 
-    // raw: vistas
+    // raw: vistas — leídas con node:sqlite y pasadas a Parquet vía NDJSON
     for (const view of RAW_VIEWS) {
       if (!existing.has(view)) {
         warnings.push(`vista inexistente: ${view} — omitida`);
         continue;
       }
       try {
-        await copyToParquet('raw', view, `SELECT * FROM pb."${view}"`);
+        const rows = sq.prepare(`SELECT * FROM "${view}"`).all();
+        if (!rows.length) { warnings.push(`vista ${view}: sin filas — omitida`); continue; }
+        const jsonPath = join(tmpDir, `${view}.json`);
+        await writeFile(jsonPath, rows.map((r) => JSON.stringify(r)).join('\n'));
+        // sample_size=-1: tipos inferidos sobre todas las filas, no solo una muestra
+        await copyToParquet('raw', view, `SELECT * FROM read_json_auto('${jsonPath}', format='newline_delimited', sample_size=-1)`);
+        await rm(jsonPath);
       } catch (err) {
-        warnings.push(`vista ${view} no legible vía DuckDB (${String(err.message).split('\n')[0]}) — TODO: reimplementar en capa curada`);
+        warnings.push(`vista ${view} no exportada (${String(err.message).split('\n')[0]})`);
       }
     }
 
@@ -273,7 +201,7 @@ export async function exportTenant({ lakeDir, pbData, tenantId, snapshotDate }) 
       await rm(jsonPath);
     };
     await writeJsonParquet('evm_daily', daily, [
-      'project_id', 'project_code', 'credit_rule_code', 'hours_oc', 'pv_pct',
+      'project_id', 'project_code', 'credit_rule_code', 'pct_a', 'pct_b', 'pct_0', 'hours_oc', 'pv_pct',
       'ev_pct', 'ev_activity_pct', 'hours_actual', 'hours_planned', 'hpi', 'spi',
     ]);
     await writeJsonParquet('evm_series', series, ['project_id', 'week', 'serie', 'value']);

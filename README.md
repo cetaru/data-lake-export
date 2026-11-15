@@ -69,11 +69,13 @@ PB_DATA=../pb/pb_tsp/pb_data/data.db TENANT_ID=tsp npm run export
 ```
 
 Validar un tenant puntual (corre su export, compara conteos raw vs. SQLite,
-imprime `evm_daily` de un proyecto y lo compara contra el hook `/pm2pro/{id}`
-en vivo de ese tenant):
+imprime `evm_daily` de un proyecto y compara hpi/spi/hours_oc de **todos** los
+proyectos contra el hook `/pm2pro/{id}` en vivo de ese tenant; el hook exige
+login, por eso las credenciales de superuser):
 
 ```bash
-PB_DATA=../pb/pb_tsp/pb_data/data.db TENANT_ID=tsp PB_URL=http://localhost:8092 npm run validate
+PB_DATA=../pb/pb_tsp/pb_data/data.db TENANT_ID=tsp PB_URL=http://localhost:8092 \
+  PB_ADMIN_EMAIL=... PB_ADMIN_PASSWORD=... npm run validate
 ```
 
 ## Config (env)
@@ -85,10 +87,17 @@ PB_DATA=../pb/pb_tsp/pb_data/data.db TENANT_ID=tsp PB_URL=http://localhost:8092 
 | `LAKE_DIR` | `/data/lake` | raíz del lake |
 | `SNAPSHOT_DATE` | hoy (UTC) | override para backfill |
 | `PB_DATA` + `TENANT_ID` | — | fuerza modo single-tenant, salta pb_ws |
+| `EVM_LIB_PATH` | `../approcket/pocketbase/pb_hooks/lib/evm.js` | módulo EVM compartido con los hooks (ver "evm_daily / evm_series") |
+| `PG_HOST` | — | si está seteado, `npm run daily` corre también `sync-postgres` |
 | `PB_URL` (validate) | `http://localhost:8090` | hook /pm2pro del tenant a comparar |
+| `PB_ADMIN_EMAIL` / `PB_ADMIN_PASSWORD` (validate) | — | superuser del tenant, para llamar al hook |
 | `VALIDATE_PROJECT_CODE` (validate) | proyecto con más reviews | proyecto piloto a inspeccionar |
 
-## Metabase: materializado en Postgres (recomendado)
+## Metabase: materializado en Postgres (opcional)
+
+> BI externa descartada por ahora: el análisis del cliente va por MCP. Esta
+> sección y `sync-postgres` quedan como referencia; `npm run daily` solo
+> corre `sync-postgres` si `PG_HOST` está seteado.
 
 **El catálogo `.duckdb` (sección siguiente) NO es viable como conexión de
 Metabase en esta VPS**: el driver comunitario de DuckDB para Metabase
@@ -166,18 +175,18 @@ donde vive `lake.duckdb`, con el driver DuckDB de Metabase ya instalado en
 ## Scheduling (producción)
 
 Diario 03:30 (después de que cada instancia PocketBase corra su cron
-`sync_holidays` de las 03:00). `bin/daily.mjs` encadena `export.mjs` →
-`sync-postgres.mjs` — si `export` falla parcialmente (algún tenant), igual
-sigue con `sync-postgres` para reflejar los datos parciales; el exit code
-final es no-cero si cualquiera de los dos falló:
+`sync_holidays` de las 03:00). `bin/daily.mjs` corre `export.mjs` y, solo si
+`PG_HOST` está seteado, `sync-postgres.mjs` — si `export` falla parcialmente
+(algún tenant), igual sigue con `sync-postgres` para reflejar los datos
+parciales; el exit code final es no-cero si cualquiera de los dos falló:
 
 ```bash
 pm2 start bin/daily.mjs --name lake-daily --cron "30 3 * * *" --no-autorestart
 pm2 save
 ```
 
-Requiere las mismas env vars de `export.mjs` (`LAKE_DIR`, `PB_WS_URL`,
-`PB_WS_ADMIN_EMAIL`/`PASSWORD` o `PB_DATA`+`TENANT_ID`) más las de
+Requiere las env vars de `export.mjs` (`LAKE_DIR`, `EVM_LIB_PATH`, `PB_WS_URL`,
+`PB_WS_ADMIN_EMAIL`/`PASSWORD` o `PB_DATA`+`TENANT_ID`) y, si se usa, las de
 `sync-postgres.mjs` (`PG_HOST`/`PORT`/`DATABASE`/`USER`/`PASSWORD`) en el
 entorno del proceso pm2 (`pm2 start` hereda el shell actual, o usar un
 ecosystem file con `env:`).
@@ -189,25 +198,39 @@ Núcleo operativo/avance, horas y recursos, financiero, dispatch — ver
 (PII), `config`, `pdf_templates`, `roles`, `role_permissions`, `workflows`,
 y toda colección/vista `test*` / `*_duplicate` / `v_b`.
 
+`origen_type` se exporta para poder filtrar documentos cancelados
+(`ignored_count = 1`), que la app deja fuera de los informes.
+
 Vistas SQL (`list_hours`, `list_document_forecast`, `list_resume_hours`) se
-exportan a `raw/` si la extensión sqlite de DuckDB puede leerlas; si no,
-quedan documentadas en `view-definitions/{tenant}.sql` (generado en cada
-corrida) para que la capa curada las reimplemente en SQL DuckDB.
+exportan a `raw/` leyéndolas con `node:sqlite` (la extensión sqlite de DuckDB
+no parsea sus backticks). `list_document_forecast` trae `erev_a/b/0`: fecha
+de emisión de cada revisión según crédito acumulado — el criterio de
+"emitida / pendiente" de la app. Las definiciones quedan además en
+`view-definitions/{tenant}.sql` (generado en cada corrida).
 
 ## evm_daily / evm_series
 
-Lógica portada 1:1 de `pb_hooks/get.pm2pro.pb.js` de cada tenant (misma
-versión de `approcket` en todos los clientes) — mismo SQL (vía `node:sqlite`,
-mismo dialecto que el hook) y mismos KPIs con sus guardas:
+**La lógica EVM no está copiada en este repo.** El exporter carga el mismo
+módulo que usa el hook `/pm2pro` de la app
+(`approcket/pocketbase/pb_hooks/lib/evm.js`, vía `src/evm-lib.mjs` y
+`EVM_LIB_PATH`): mismas queries y misma matemática de KPIs, así que un cambio
+en el hook llega al lake sin tocar nada acá. En producción apuntar
+`EVM_LIB_PATH` al `pb_hooks/lib/evm.js` con el que corren las instancias
+PocketBase. Requiere que el tenant tenga las migraciones de approcket al día
+(ej. `origen_type.ignored_count`); si no, ese tenant falla con
+`no such column` y el resto sigue.
 
+- `pct_a` / `pct_b` / `pct_0`: split de la credit rule del proyecto
+  (default .70 / 0 / .30).
+- `hours_oc`: horas presupuestadas, sin documentos cancelados.
 - `pv_pct`: curva planificada acumulada interpolada linealmente a la fecha de
-  snapshot (pesos × split de credit rule: `AB0` → A .70/B .15/0 .15; default
-  → A .70/0 .30).
+  snapshot (pesos × split de la credit rule).
 - `ev_pct`: último acumulado de `weight × real_credit` (document_review).
-- `ev_activity_pct`: ídem ponderado por horas (`hs_total/hours_oc × real_credit`).
+- `ev_activity_pct`: ídem ponderado por horas (`hs_total/hours_oc × real_credit`),
+  sin documentos cancelados.
 - `hours_actual`: horas cargadas a la fecha, excluyendo `specialties.ignored_count=1`.
-- `hpi = (pv_pct/100 × hours_oc) / hours_actual` — **es PV/AC, no EV/AC**; se
-  porta tal cual del hook para que la validación cierre.
+- `hpi = (pv_pct/100 × hours_oc) / hours_actual` — **es PV/AC, no EV/AC**; así
+  lo define el hook.
 - `spi = ev_pct / pv_pct`.
 
 `evm_series`: series semanales acumuladas (`planned` / `real` / `activity`)

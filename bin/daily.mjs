@@ -31,12 +31,18 @@ try {
   console.error(`\nexport.mjs terminó con errores (exit ${err.status ?? '?'}) — sigo con sync-postgres igual.`);
 }
 
+// sync-postgres solo alimenta una BI externa (Metabase) — opcional: corre
+// únicamente si hay un Postgres configurado (PG_HOST).
 let syncFailed = false;
-try {
-  run('sync-postgres.mjs');
-} catch (err) {
-  syncFailed = true;
-  console.error(`\nsync-postgres.mjs FALLÓ (exit ${err.status ?? '?'}).`);
+if (process.env.PG_HOST) {
+  try {
+    run('sync-postgres.mjs');
+  } catch (err) {
+    syncFailed = true;
+    console.error(`\nsync-postgres.mjs FALLÓ (exit ${err.status ?? '?'}).`);
+  }
+} else {
+  console.log('\nPG_HOST no seteado — sync-postgres salteado.');
 }
 
 const failed = exportFailed || syncFailed;
