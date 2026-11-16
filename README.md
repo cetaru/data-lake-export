@@ -278,6 +278,12 @@ número se puede rastrear hasta las emisiones históricas del tenant.
 Al quedar un snapshot por día, `risk_daily` acumula la evolución del riesgo
 de cada proyecto (monitoreo).
 
+**Riesgo en el dashboard de la app**: en cada corrida del día el exporter deja
+`<pb_data del tenant>/lake/risk_daily.json` (riesgo de hoy por proyecto + nivel
+del snapshot anterior). El hook `/dashboard` de approcket lo lee de su propio
+directorio de datos; no hay credenciales ni llamadas de red. `APP_RISK_FEED=0`
+lo desactiva.
+
 ## Queries de ejemplo (DuckDB CLI)
 
 Curva EVM histórica de un proyecto, cruzando snapshots:

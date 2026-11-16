@@ -30,6 +30,7 @@ import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { loadEvmLib, toSqlite } from './evm-lib.mjs';
 import { exportRisk } from './risk.mjs';
+import { writeAppRiskFeed } from './app-feed.mjs';
 
 // Colecciones raw (ver README). users, config, pdf_templates, etc. quedan
 // excluidas (PII / operativas / legacy).
@@ -219,6 +220,10 @@ export async function exportTenant({ lakeDir, pbData, tenantId, snapshotDate }) 
         rawParquet: (name) => tmpParquet('raw', name),
         evmDailyParquet: tmpParquet('curated', 'evm_daily'),
       }));
+      const riskParquet = tmpParquet('curated', 'risk_daily');
+      if (riskParquet && process.env.APP_RISK_FEED !== '0') {
+        await writeAppRiskFeed({ con, riskParquet, lakeDir, tenantId, snapshotDate, pbData });
+      }
     } catch (err) {
       warnings.push(`riesgo no calculado (${String(err.message).split('\n')[0]})`);
     }
