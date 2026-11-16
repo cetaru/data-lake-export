@@ -3,3 +3,5 @@ node_modules/
 /data/
 view-definitions/
 *.log
+research/data/
+research/venv/
