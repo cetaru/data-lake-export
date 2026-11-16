@@ -19,6 +19,11 @@ pb_data_path   text   path absoluto al data.db del tenant en esta VPS
                        (ej. /home/.../code/pb/pb_tsp/pb_data/data.db)
 ```
 
+Alternativa sin tocar `pb_ws`: `PB_DATA_TEMPLATE`, un path con `{tenant}`
+que se completa con el `code` de cada workspace (es lo que usa producción:
+`/root/sites/traksync.io/pb-workspaces/{tenant}/pb_data/data.db`). Los
+workspaces sin `data.db` en esa ruta se omiten con un aviso.
+
 **Este campo no existe todavía** — hay que agregarlo con una migración en el
 repo de control-plane de `pb_ws` (fuera de este repo). Hasta que exista, el
 export multi-tenant no encuentra tenants (loggea warning y sale con error).
