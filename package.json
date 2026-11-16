@@ -12,7 +12,8 @@
     "validate": "node bin/validate.mjs",
     "build-catalog": "node bin/build-catalog.mjs",
     "sync-postgres": "node bin/sync-postgres.mjs",
-    "daily": "node bin/daily.mjs"
+    "daily": "node bin/daily.mjs",
+    "backtest": "node bin/backtest.mjs"
   },
   "dependencies": {
     "@duckdb/node-api": "^1.5.4-r.1",
