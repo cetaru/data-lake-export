@@ -4,6 +4,7 @@
  *   raw/{collection}/tenant_id=X/snapshot_date=YYYY-MM-DD/data.parquet
  *   curated/evm_daily/tenant_id=X/snapshot_date=YYYY-MM-DD/data.parquet
  *   curated/evm_series/tenant_id=X/snapshot_date=YYYY-MM-DD/data.parquet
+ *   curated/{delay_stats,risk_revisions,risk_daily}/... (ver src/risk.mjs)
  *
  * Portado 1:1 desde approcket/scripts/lake/export.mjs (rama
  * feature/data-lake-export), parametrizado para poder correr en loop sobre
@@ -28,6 +29,7 @@ import { mkdir, rm, rename, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { loadEvmLib, toSqlite } from './evm-lib.mjs';
+import { exportRisk } from './risk.mjs';
 
 // Colecciones raw (ver README). users, config, pdf_templates, etc. quedan
 // excluidas (PII / operativas / legacy).
@@ -205,6 +207,21 @@ export async function exportTenant({ lakeDir, pbData, tenantId, snapshotDate }) 
       'ev_pct', 'ev_activity_pct', 'hours_actual', 'hours_planned', 'hpi', 'spi',
     ]);
     await writeJsonParquet('evm_series', series, ['project_id', 'week', 'serie', 'value']);
+
+    // curated: schedule risk (delay statistics, projected dates, project score)
+    const tmpParquet = (layer, name) => {
+      const file = join(partition(layer, name), 'data.parquet');
+      return existsSync(file) ? file : null;
+    };
+    try {
+      warnings.push(...await exportRisk({
+        con, snapshotDate, copyToParquet,
+        rawParquet: (name) => tmpParquet('raw', name),
+        evmDailyParquet: tmpParquet('curated', 'evm_daily'),
+      }));
+    } catch (err) {
+      warnings.push(`riesgo no calculado (${String(err.message).split('\n')[0]})`);
+    }
   } finally {
     sq.close();
     con.closeSync();

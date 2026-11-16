@@ -247,6 +247,37 @@ por proyecto — insumo directo de las curvas del dashboard sin recalcular.
 > Al monetizar, elegir el período de costos vigente a la fecha del snapshot —
 > no portar el bug. `/pxq` (a secas) es un stub roto: ignorar.
 
+## Riesgo de atraso (delay_stats / risk_revisions / risk_daily)
+
+Capa curada calculada en `src/risk.mjs` con DuckDB sobre el snapshot recién
+exportado. Es estadística empírica (sin entrenamiento de modelos): cada
+número se puede rastrear hasta las emisiones históricas del tenant.
+
+- `delay_stats`: atraso histórico de las revisiones emitidas (fecha de
+  emisión − fecha de referencia, en días) por especialidad, tipo de documento
+  y revisión: tamaño de muestra, % a tiempo, media, mediana y percentil 80.
+  Dos bases: `planned` (contra la fecha planificada) y `forecast` (contra la
+  fecha forecast, o sea cuánto se equivocan los forecasts).
+- `risk_revisions`: cada revisión pendiente (documentos cancelados afuera) con
+  su fecha proyectada. Referencia = forecast, o planificada si no hay
+  forecast. Proyección = referencia + atraso típico (mediana → `p50`,
+  percentil 80 → `p80`) del grupo más específico con ≥ 15 emisiones
+  (especialidad + tipo + revisión → especialidad + revisión → revisión). Si la
+  revisión ya está vencida hace `d` días, se proyecta desde hoy sumando
+  cuánto más tardaron las revisiones históricas que se atrasaron más de `d`
+  días. Si ninguna se atrasó tanto, se marca `beyond_history`: la fecha
+  probablemente está desactualizada.
+- `risk_daily`: una fila por proyecto — fin proyectado (`p50`/`p80`), desvío
+  contra `end_date`, SPI/HPI, horas al finalizar (cargadas + remanentes) vs
+  presupuesto, fin según el ritmo de carga de las últimas 4 semanas, y un
+  `risk_score` 0-100 con `risk_level` y `risk_reasons`. El score suma:
+  desvío pesimista (hasta 40, tope a 60 días), SPI (hasta 25, tope en 0.70),
+  porción vencida de lo pendiente (hasta 15) y sobreconsumo de horas (hasta
+  20, tope a +30 %). `high` ≥ 60, `medium` ≥ 30, `none` = nada pendiente.
+
+Al quedar un snapshot por día, `risk_daily` acumula la evolución del riesgo
+de cada proyecto (monitoreo).
+
 ## Queries de ejemplo (DuckDB CLI)
 
 Curva EVM histórica de un proyecto, cruzando snapshots:
